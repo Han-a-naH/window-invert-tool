@@ -25,6 +25,7 @@ kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
 shell32 = ctypes.WinDLL("shell32", use_last_error=True)
 dwmapi = ctypes.WinDLL("dwmapi", use_last_error=True)
 gdi32 = ctypes.WinDLL("gdi32", use_last_error=True)
+shcore = ctypes.WinDLL("shcore", use_last_error=True)
 
 try:
     SetProcessDpiAwarenessContext = user32.SetProcessDpiAwarenessContext
@@ -70,12 +71,16 @@ WS_EX_TOPMOST = 0x00000008
 WS_EX_TRANSPARENT = 0x00000020
 WS_EX_NOACTIVATE = 0x08000000
 WS_EX_LAYERED = 0x00080000
+WS_EX_NOREDIRECTIONBITMAP = 0x00200000
+GWL_EXSTYLE = -20
 SW_HIDE = 0
 SW_SHOW = 5
 SWP_NOACTIVATE = 0x0010
 SWP_SHOWWINDOW = 0x0040
 SWP_NOOWNERZORDER = 0x0200
 HWND_TOPMOST = HWND(-1)
+GW_OWNER = 4
+GA_ROOTOWNER = 3
 
 MF_STRING = 0x0000
 MF_SEPARATOR = 0x0800
@@ -94,6 +99,8 @@ NIF_TIP = 0x00000004
 IDI_APPLICATION = 32512
 ULW_ALPHA = 0x00000002
 NOTSRCCOPY = 0x00330008
+SRCCOPY = 0x00CC0020
+STRETCH_HALFTONE = 4
 DWMWA_CLOAKED = 14
 DWMWA_EXTENDED_FRAME_BOUNDS = 9
 ERROR_ALREADY_EXISTS = 183
@@ -186,6 +193,28 @@ class Box:
         return self.bottom - self.top
 
 
+@dataclass
+class CaptureSurface:
+    """A rendered window bitmap kept alive between refreshes."""
+
+    dc: HDC
+    bitmap: wintypes.HBITMAP
+    old_bitmap: wintypes.HGDIOBJ
+    box: Box
+    dpi_signature: tuple[int, int]
+
+
+@dataclass
+class TargetState:
+    """Per-window capture/cache state for a selected inversion target."""
+
+    hwnd: int
+    surface: Optional[CaptureSurface] = None
+    surface_key: Optional[tuple[int, int, int, int]] = None
+    last_capture_box: Optional[Box] = None
+    last_boxes: Optional[tuple[Box, ...]] = None
+
+
 def _handle(hwnd: Optional[Union[HWND, int]]) -> int:
     """Return a numeric HWND value (ctypes HWND is a c_void_p on 64-bit)."""
     if hwnd is None:
@@ -207,6 +236,10 @@ def _configure_api() -> None:
     user32.IsIconic.restype = wintypes.BOOL
     user32.GetWindowRect.argtypes = [HWND, ctypes.POINTER(RECT)]
     user32.GetWindowRect.restype = wintypes.BOOL
+    user32.GetDpiForWindow.argtypes = [HWND]
+    user32.GetDpiForWindow.restype = wintypes.UINT
+    user32.MonitorFromWindow.argtypes = [HWND, wintypes.DWORD]
+    user32.MonitorFromWindow.restype = wintypes.HANDLE
     user32.GetSystemMetrics.argtypes = [ctypes.c_int]
     user32.GetSystemMetrics.restype = ctypes.c_int
     user32.GetWindowTextLengthW.argtypes = [HWND]
@@ -215,6 +248,12 @@ def _configure_api() -> None:
     user32.GetClassNameW.argtypes = [HWND, wintypes.LPWSTR, ctypes.c_int]
     user32.GetWindow.argtypes = [HWND, wintypes.UINT]
     user32.GetWindow.restype = HWND
+    user32.GetAncestor.argtypes = [HWND, wintypes.UINT]
+    user32.GetAncestor.restype = HWND
+    user32.GetWindowLongPtrW.argtypes = [HWND, ctypes.c_int]
+    user32.GetWindowLongPtrW.restype = ctypes.c_ssize_t
+    user32.GetWindowThreadProcessId.argtypes = [HWND, ctypes.POINTER(wintypes.DWORD)]
+    user32.GetWindowThreadProcessId.restype = wintypes.DWORD
     user32.CreateWindowExW.argtypes = [wintypes.DWORD, wintypes.LPCWSTR,
                                        wintypes.LPCWSTR, wintypes.DWORD,
                                        ctypes.c_int, ctypes.c_int, ctypes.c_int,
@@ -287,14 +326,30 @@ def _configure_api() -> None:
                              ctypes.c_int, HDC, ctypes.c_int, ctypes.c_int,
                              wintypes.DWORD]
     gdi32.BitBlt.restype = wintypes.BOOL
+    gdi32.StretchBlt.argtypes = [HDC, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                                 ctypes.c_int, HDC, ctypes.c_int, ctypes.c_int,
+                                 ctypes.c_int, ctypes.c_int, wintypes.DWORD]
+    gdi32.StretchBlt.restype = wintypes.BOOL
+    gdi32.SetStretchBltMode.argtypes = [HDC, ctypes.c_int]
+    gdi32.SetStretchBltMode.restype = ctypes.c_int
     kernel32.GetModuleHandleW.argtypes = [wintypes.LPCWSTR]
     kernel32.GetModuleHandleW.restype = HINSTANCE
     kernel32.CreateMutexW.argtypes = [wintypes.LPVOID, wintypes.BOOL, wintypes.LPCWSTR]
     kernel32.CreateMutexW.restype = wintypes.HANDLE
+    kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.QueryFullProcessImageNameW.argtypes = [wintypes.HANDLE, wintypes.DWORD,
+                                                     wintypes.LPWSTR,
+                                                     ctypes.POINTER(wintypes.DWORD)]
+    kernel32.QueryFullProcessImageNameW.restype = wintypes.BOOL
     kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
     kernel32.CloseHandle.restype = wintypes.BOOL
     user32.RegisterWindowMessageW.argtypes = [wintypes.LPCWSTR]
     user32.RegisterWindowMessageW.restype = wintypes.UINT
+    shcore.GetDpiForMonitor.argtypes = [wintypes.HANDLE, ctypes.c_int,
+                                        ctypes.POINTER(wintypes.UINT),
+                                        ctypes.POINTER(wintypes.UINT)]
+    shcore.GetDpiForMonitor.restype = ctypes.c_long
 
 
 _configure_api()
@@ -312,6 +367,15 @@ def _rect_for(hwnd: int) -> Optional[Box]:
     return box if box.width > 0 and box.height > 0 else None
 
 
+def _window_rect_for(hwnd: int) -> Optional[Box]:
+    """Return the full Win32 window rect, including invisible resize borders."""
+    rect = RECT()
+    if not user32.GetWindowRect(HWND(hwnd), ctypes.byref(rect)):
+        return None
+    box = Box(rect.left, rect.top, rect.right, rect.bottom)
+    return box if box.width > 0 and box.height > 0 else None
+
+
 def _virtual_screen() -> Box:
     """Return the current virtual desktop in physical, DPI-aware pixels."""
     return Box(
@@ -319,6 +383,18 @@ def _virtual_screen() -> Box:
         user32.GetSystemMetrics(76) + user32.GetSystemMetrics(78),
         user32.GetSystemMetrics(77) + user32.GetSystemMetrics(79),
     )
+
+
+def _monitor_dpi(hwnd: int) -> int:
+    """Get effective DPI for the monitor containing a window."""
+    monitor = user32.MonitorFromWindow(HWND(hwnd), 2)  # MONITOR_DEFAULTTONEAREST
+    if monitor:
+        dpi_x = wintypes.UINT()
+        dpi_y = wintypes.UINT()
+        if shcore.GetDpiForMonitor(monitor, 0, ctypes.byref(dpi_x),
+                                   ctypes.byref(dpi_y)) == 0 and dpi_x.value:
+            return int(dpi_x.value)
+    return 96
 
 
 def _clip_box(box: Box, bounds: Box) -> Optional[Box]:
@@ -332,6 +408,25 @@ def _is_cloaked(hwnd: int) -> bool:
     result = dwmapi.DwmGetWindowAttribute(HWND(hwnd), DWMWA_CLOAKED,
                                           ctypes.byref(value), ctypes.sizeof(value))
     return result == 0 and value.value != 0
+
+
+def _is_owned_by(hwnd: int, owner: int) -> bool:
+    """Return whether a top-level window is owned by the target window."""
+    if not hwnd or not owner or hwnd == owner:
+        return False
+    root_owner = _handle(user32.GetAncestor(HWND(hwnd), GA_ROOTOWNER))
+    if root_owner == owner:
+        return True
+    # Some frameworks use an intermediate owner window. Walk that chain as a
+    # fallback because GetAncestor can stop at the framework's helper window.
+    current = hwnd
+    visited: set[int] = set()
+    while current and current not in visited:
+        visited.add(current)
+        current = _handle(user32.GetWindow(HWND(current), GW_OWNER))
+        if current == owner:
+            return True
+    return False
 
 
 def _window_title(hwnd: int) -> tuple[str, str]:
@@ -431,8 +526,14 @@ class Overlay:
 class InvertApp:
     TIMER_ID = 7
     CMD_SELECT_BASE = 1000
+    CMD_SPEED_BASE = 20
     CMD_TOGGLE = 10
     CMD_EXIT = 11
+    RENDER_SPEEDS = (
+        (15, 67, "15 FPS（省资源）"),
+        (30, 33, "30 FPS（标准）"),
+        (60, 16, "60 FPS（流畅）"),
+    )
 
     def __init__(self) -> None:
         self.mutex = kernel32.CreateMutexW(None, True, "Local\\WindowInvertTrayMutex")
@@ -451,6 +552,13 @@ class InvertApp:
         self.window_cache: dict[int, int] = {}
         self.tray_added = False
         self.menu_open = False
+        self.target_surface: Optional[CaptureSurface] = None
+        self.target_surface_key: Optional[tuple[int, int, int, int]] = None
+        self.last_capture_box: Optional[Box] = None
+        self.last_target_boxes: Optional[tuple[Box, ...]] = None
+        self.process_name_cache: dict[int, tuple[int, str]] = {}
+        self.render_fps = 30
+        self.render_interval_ms = 33
         self.taskbar_created_msg = user32.RegisterWindowMessageW("TaskbarCreated")
         self.running = True
         self._register_classes()
@@ -461,7 +569,7 @@ class InvertApp:
         if not self.hwnd:
             raise ctypes.WinError(ctypes.get_last_error())
         self._add_tray_icon()
-        user32.SetTimer(self.hwnd, self.TIMER_ID, 33, None)
+        user32.SetTimer(self.hwnd, self.TIMER_ID, self.render_interval_ms, None)
 
     def _register_classes(self) -> None:
         @WNDPROC
@@ -512,7 +620,7 @@ class InvertApp:
 
     def _set_tray_tip(self) -> None:
         if self.enabled and self.target:
-            tip = "窗口反相：开启"
+            tip = f"窗口反相：开启（{self.render_fps} FPS）"
         elif self.target:
             tip = "窗口反相：关闭"
         else:
@@ -580,6 +688,7 @@ class InvertApp:
         windows = self._enumerate_windows()
         menu = user32.CreatePopupMenu()
         submenu = user32.CreatePopupMenu()
+        speed_menu = user32.CreatePopupMenu()
         self.window_cache.clear()
         for index, info in enumerate(windows):
             command = self.CMD_SELECT_BASE + index
@@ -592,6 +701,11 @@ class InvertApp:
         user32.AppendMenuW(menu, MF_POPUP, submenu, "选择反相窗口")
         user32.AppendMenuW(menu, MF_STRING | (MF_CHECKED if self.enabled else 0),
                            self.CMD_TOGGLE, "关闭反相" if self.enabled else "开启反相")
+        for index, (fps, _interval, label) in enumerate(self.RENDER_SPEEDS):
+            marker = MF_CHECKED if fps == self.render_fps else 0
+            user32.AppendMenuW(speed_menu, MF_STRING | marker,
+                               self.CMD_SPEED_BASE + index, label)
+        user32.AppendMenuW(menu, MF_POPUP, speed_menu, "渲染速度")
         user32.AppendMenuW(menu, MF_SEPARATOR, 0, None)
         user32.AppendMenuW(menu, MF_STRING, self.CMD_EXIT, "退出")
         point = POINT()
@@ -606,17 +720,39 @@ class InvertApp:
             self.menu_open = False
         user32.PostMessageW(self.hwnd, WM_NULL, 0, 0)
         user32.DestroyMenu(submenu)
+        user32.DestroyMenu(speed_menu)
         user32.DestroyMenu(menu)
         if command in self.window_cache:
             self.select_window(self.window_cache[command])
         elif command == self.CMD_TOGGLE:
             self.toggle()
+        elif self.CMD_SPEED_BASE <= command < self.CMD_SPEED_BASE + len(self.RENDER_SPEEDS):
+            self.set_render_speed(self.RENDER_SPEEDS[command - self.CMD_SPEED_BASE][0])
         elif command == self.CMD_EXIT:
             self.shutdown()
+
+    def set_render_speed(self, fps: int) -> None:
+        for option_fps, interval, _label in self.RENDER_SPEEDS:
+            if option_fps != fps:
+                continue
+            self.render_fps = option_fps
+            self.render_interval_ms = interval
+            if self.hwnd and self.running:
+                user32.KillTimer(self.hwnd, self.TIMER_ID)
+                user32.SetTimer(self.hwnd, self.TIMER_ID,
+                                self.render_interval_ms, None)
+            self._set_tray_tip()
+            return
 
     def select_window(self, hwnd: int) -> None:
         if not user32.IsWindow(HWND(hwnd)):
             return
+        if self.target != hwnd:
+            self._destroy_capture_surface(self.target_surface)
+            self.target_surface = None
+            self.target_surface_key = None
+            self.last_capture_box = None
+            self.last_target_boxes = None
         self.target = hwnd
         self.enabled = True
         self._set_tray_tip()
@@ -627,14 +763,119 @@ class InvertApp:
             ctypes.windll.user32.MessageBoxW(self.hwnd, "请先选择反相窗口。", "窗口反相", 0x40)
             self.target = None
             self.enabled = False
+            self._destroy_capture_surface(self.target_surface)
+            self.target_surface = None
+            self.target_surface_key = None
+            self.last_capture_box = None
+            self.last_target_boxes = None
             self._set_tray_tip()
             return
         self.enabled = not self.enabled
         self._set_tray_tip()
         self.refresh()
 
-    def _visible_boxes(self, target: int) -> list[Box]:
-        target_box = _rect_for(target)
+    @staticmethod
+    def _destroy_capture_surface(surface: Optional[CaptureSurface]) -> None:
+        if not surface:
+            return
+        if surface.dc:
+            gdi32.SelectObject(surface.dc, surface.old_bitmap)
+            if surface.bitmap:
+                gdi32.DeleteObject(surface.bitmap)
+            gdi32.DeleteDC(surface.dc)
+
+    def _dpi_signature(self, target: int) -> tuple[int, int]:
+        monitor_dpi = _monitor_dpi(target)
+        target_dpi = int(user32.GetDpiForWindow(HWND(target)) or monitor_dpi)
+        return monitor_dpi, target_dpi
+
+    def _process_name(self, hwnd: int) -> str:
+        process_id = wintypes.DWORD()
+        user32.GetWindowThreadProcessId(HWND(hwnd), ctypes.byref(process_id))
+        cached = self.process_name_cache.get(hwnd)
+        if cached is not None and cached[0] == process_id.value:
+            return cached[1]
+        process = kernel32.OpenProcess(0x1000, False, process_id.value)
+        name = ""
+        if process:
+            buffer = ctypes.create_unicode_buffer(512)
+            length = wintypes.DWORD(len(buffer))
+            if kernel32.QueryFullProcessImageNameW(process, 0, buffer,
+                                                   ctypes.byref(length)):
+                name = buffer.value.rsplit("\\", 1)[-1].lower()
+            kernel32.CloseHandle(process)
+        self.process_name_cache[hwnd] = (process_id.value, name)
+        return name
+
+    @staticmethod
+    def _window_exstyle(hwnd: int) -> int:
+        return int(user32.GetWindowLongPtrW(HWND(hwnd), GWL_EXSTYLE)) & 0xFFFFFFFF
+
+    def _is_transient_shell_occluder(self, hwnd: int,
+                                      box: Optional[Box] = None) -> bool:
+        """Ignore the oversized transparent host used by Windows Snap Layouts."""
+        if not box:
+            box = _rect_for(hwnd)
+        if not box:
+            return False
+        _, class_name = _window_title(hwnd)
+        class_name = class_name.lower()
+        virtual = _virtual_screen()
+        near_top = box.top <= virtual.top + 32
+        large_host = (box.width >= max(600, int(virtual.width * 0.70))
+                      or box.height >= max(300, int(virtual.height * 0.35)))
+        if not near_top or not large_host:
+            return False
+
+        exstyle = self._window_exstyle(hwnd)
+        xaml_host = class_name.startswith("xamlexplorerhostislandwindow")
+        if xaml_host and exstyle & WS_EX_NOREDIRECTIONBITMAP:
+            return True
+
+        shell_process = self._process_name(hwnd) in {
+            "explorer.exe", "shellexperiencehost.exe",
+            "startmenuexperiencehost.exe",
+        }
+        if (shell_process and exstyle & WS_EX_NOREDIRECTIONBITMAP
+                and exstyle & WS_EX_TOOLWINDOW and exstyle & WS_EX_TOPMOST):
+            return True
+
+        # Depending on the Windows build, Snap Layouts can be hosted by a
+        # CoreWindow in Explorer or ShellExperienceHost rather than the XAML
+        # island class. Restrict this fallback to a system process and a
+        # non-activating composition window to avoid skipping real app windows.
+        return bool(shell_process
+                    and class_name in {"windows.ui.core.corewindow", "applicationframewindow"}
+                    and exstyle & WS_EX_NOACTIVATE
+                    and exstyle & WS_EX_NOREDIRECTIONBITMAP)
+
+    def _owned_windows_above(self, target: int,
+                             order: Optional[list[int]] = None) -> list[int]:
+        """Find visible owned popups (menus/dialogs) above the target."""
+        order = order or self._z_order_windows()
+        try:
+            target_index = order.index(target)
+        except ValueError:
+            return []
+        own_hosts = {_handle(item.host) for item in self.overlays if item.host}
+        result: list[int] = []
+        for hwnd in order[:target_index]:
+            if hwnd in own_hosts or hwnd == _handle(self.hwnd):
+                continue
+            if not _is_owned_by(hwnd, target):
+                continue
+            if not user32.IsWindowVisible(HWND(hwnd)) or user32.IsIconic(HWND(hwnd)):
+                continue
+            if _is_cloaked(hwnd):
+                continue
+            if self._is_transient_shell_occluder(hwnd):
+                continue
+            if _rect_for(hwnd):
+                result.append(hwnd)
+        return result
+
+    def _visible_boxes(self, target: int, target_box: Optional[Box] = None) -> list[Box]:
+        target_box = target_box or _rect_for(target)
         if not target_box or user32.IsIconic(HWND(target)) or not user32.IsWindowVisible(HWND(target)):
             return []
         target_box = _clip_box(target_box, _virtual_screen())
@@ -656,6 +897,8 @@ class InvertApp:
             occluder = _rect_for(hwnd)
             if not occluder:
                 continue
+            if self._is_transient_shell_occluder(hwnd, occluder):
+                continue
             next_visible: list[Box] = []
             for box in visible:
                 next_visible.extend(_subtract_box(box, occluder))
@@ -669,66 +912,187 @@ class InvertApp:
                 return []
         return visible
 
+    def _render_target(self, target: int, physical_box: Box,
+                       screen_dc: HDC, output_dc: HDC) -> bool:
+        """Render a target window at physical size, compensating DPI-unaware apps."""
+        monitor_dpi = _monitor_dpi(target)
+        target_dpi = int(user32.GetDpiForWindow(HWND(target)) or monitor_dpi)
+        scale = target_dpi / float(monitor_dpi or 96)
+        render_width = max(1, int(round(physical_box.width * scale)))
+        render_height = max(1, int(round(physical_box.height * scale)))
+
+        render_dc = gdi32.CreateCompatibleDC(screen_dc)
+        render_bitmap = gdi32.CreateCompatibleBitmap(screen_dc, render_width, render_height)
+        if not render_dc or not render_bitmap:
+            if render_dc:
+                gdi32.DeleteDC(render_dc)
+            return False
+        old_bitmap = gdi32.SelectObject(render_dc, render_bitmap)
+        try:
+            printed = user32.PrintWindow(HWND(target), render_dc, 2)
+            if not printed:
+                printed = user32.PrintWindow(HWND(target), render_dc, 0)
+            if not printed:
+                return False
+            if render_width == physical_box.width and render_height == physical_box.height:
+                return bool(gdi32.BitBlt(output_dc, 0, 0, physical_box.width,
+                                         physical_box.height, render_dc, 0, 0, SRCCOPY))
+            gdi32.SetStretchBltMode(output_dc, STRETCH_HALFTONE)
+            return bool(gdi32.StretchBlt(output_dc, 0, 0, physical_box.width,
+                                         physical_box.height, render_dc, 0, 0,
+                                         render_width, render_height, SRCCOPY))
+        finally:
+            gdi32.SelectObject(render_dc, old_bitmap)
+            gdi32.DeleteObject(render_bitmap)
+            gdi32.DeleteDC(render_dc)
+
+    def _capture_window(self, target: int, capture_box: Box,
+                        screen_dc: HDC) -> Optional[CaptureSurface]:
+        source_dc = gdi32.CreateCompatibleDC(screen_dc)
+        source_bitmap = gdi32.CreateCompatibleBitmap(screen_dc,
+                                                     capture_box.width,
+                                                     capture_box.height)
+        if not source_dc or not source_bitmap:
+            if source_dc:
+                gdi32.DeleteDC(source_dc)
+            if source_bitmap:
+                gdi32.DeleteObject(source_bitmap)
+            return None
+        old_source_bitmap = gdi32.SelectObject(source_dc, source_bitmap)
+        if not self._render_target(target, capture_box, screen_dc, source_dc):
+            gdi32.SelectObject(source_dc, old_source_bitmap)
+            gdi32.DeleteObject(source_bitmap)
+            gdi32.DeleteDC(source_dc)
+            return None
+        return CaptureSurface(source_dc, source_bitmap, old_source_bitmap,
+                              capture_box, self._dpi_signature(target))
+
     def refresh(self) -> None:
         if not self.enabled or not self.target or not user32.IsWindow(HWND(self.target)):
             if self.target and not user32.IsWindow(HWND(self.target)):
                 self.target = None
                 self.enabled = False
+                self._destroy_capture_surface(self.target_surface)
+                self.target_surface = None
+                self.target_surface_key = None
+                self.last_capture_box = None
+                self.last_target_boxes = None
                 self._set_tray_tip()
             for item in self.overlays:
                 item.hide()
             return
-        target_box = _rect_for(self.target)
-        if not target_box:
+        capture_box = _window_rect_for(self.target)
+        visible_box = _rect_for(self.target)
+        if not capture_box or not visible_box:
             for item in self.overlays:
                 item.hide()
             return
-        target_box = _clip_box(target_box, _virtual_screen())
-        if not target_box:
+        # Capture from the full Win32 rect, but place overlays against the DWM
+        # visible bounds. This removes invisible resize-border offsets while
+        # retaining correct content when the window crosses the left/top edge.
+        boxes = self._visible_boxes(self.target, visible_box)
+        boxes_snapshot = tuple(boxes)
+        boxes_changed = self.last_target_boxes != boxes_snapshot
+        order = self._z_order_windows()
+        owned_windows = self._owned_windows_above(self.target, order)
+
+        # During a mouse move/drag loop some applications return a partially
+        # painted frame from PrintWindow. Reuse the last complete bitmap while
+        # only the window position or occlusion changes; the next unchanged
+        # frame refreshes it normally. This keeps the effect continuous without
+        # hiding half of the overlay during a drag.
+        dpi_signature = self._dpi_signature(self.target)
+        surface_key = (capture_box.width, capture_box.height,
+                       dpi_signature[0], dpi_signature[1])
+        position_changed = bool(
+            self.last_capture_box
+            and (capture_box.left != self.last_capture_box.left
+                 or capture_box.top != self.last_capture_box.top)
+        )
+
+        if not boxes and not owned_windows:
             for item in self.overlays:
                 item.hide()
+            self.last_capture_box = capture_box
+            self.last_target_boxes = boxes_snapshot
             return
-        boxes = self._visible_boxes(self.target)
-        while len(self.overlays) < len(boxes):
-            try:
-                self.overlays.append(Overlay(self))
-            except (OSError, RuntimeError):
-                break
-        if not boxes:
-            for item in self.overlays:
-                item.hide()
-            return
-        # PrintWindow renders the target into an off-screen bitmap, so the
-        # already-visible overlays never become part of their own source.
+
         screen_dc = user32.GetDC(None)
         if not screen_dc:
             return
-        source_dc = gdi32.CreateCompatibleDC(screen_dc)
-        source_bitmap = gdi32.CreateCompatibleBitmap(screen_dc,
-                                                     target_box.width, target_box.height)
-        if not source_dc or not source_bitmap:
-            if source_dc:
-                gdi32.DeleteDC(source_dc)
-            user32.ReleaseDC(None, screen_dc)
-            return
-        old_source_bitmap = gdi32.SelectObject(source_dc, source_bitmap)
+        popup_surfaces: list[CaptureSurface] = []
         try:
-            printed = user32.PrintWindow(HWND(self.target), source_dc, 2)
-            if not printed:
-                # Some windows only honor the legacy WM_PRINT path.
-                printed = user32.PrintWindow(HWND(self.target), source_dc, 0)
-            if not printed:
-                return
+            target_surface: Optional[CaptureSurface] = None
+            if boxes:
+                target_surface = self.target_surface
+                need_capture = (
+                    target_surface is None
+                    or self.target_surface_key != surface_key
+                    or (not position_changed and not boxes_changed)
+                )
+                if need_capture:
+                    fresh_surface = self._capture_window(self.target, capture_box,
+                                                         screen_dc)
+                    if fresh_surface:
+                        self._destroy_capture_surface(target_surface)
+                        target_surface = fresh_surface
+                        self.target_surface = fresh_surface
+                        self.target_surface_key = surface_key
+                    elif target_surface is None or self.target_surface_key != surface_key:
+                        for item in self.overlays:
+                            item.hide()
+                        self.last_capture_box = capture_box
+                        self.last_target_boxes = boxes_snapshot
+                        return
+                if target_surface:
+                    # The bitmap pixels are relative to the window frame, so
+                    # use the current frame origin even when reusing it after a
+                    # pure move.
+                    regions: list[tuple[Box, HDC, Box]] = [
+                        (box, target_surface.dc, capture_box) for box in boxes
+                    ]
+                else:
+                    regions = []
+            else:
+                regions = []
+
+            # Owned top-level popups (for example a browser context menu) are
+            # separate windows and therefore absent from PrintWindow(target).
+            # Capture each one independently and keep its rectangle out of the
+            # target's visible boxes so the two overlays do not overlap.
+            for popup in owned_windows:
+                popup_capture_box = _window_rect_for(popup)
+                popup_visible_box = _rect_for(popup)
+                if not popup_capture_box or not popup_visible_box:
+                    continue
+                popup_boxes = self._visible_boxes(popup, popup_visible_box)
+                if not popup_boxes:
+                    continue
+                popup_surface = self._capture_window(popup, popup_capture_box,
+                                                     screen_dc)
+                if not popup_surface:
+                    continue
+                popup_surfaces.append(popup_surface)
+                regions.extend((box, popup_surface.dc, popup_capture_box)
+                               for box in popup_boxes)
+
+            while len(self.overlays) < len(regions):
+                try:
+                    self.overlays.append(Overlay(self))
+                except (OSError, RuntimeError):
+                    break
             for index, item in enumerate(self.overlays):
-                if index < len(boxes):
-                    item.set_box(boxes[index])
-                    item.update_pixels(source_dc, target_box)
+                if index < len(regions):
+                    box, source_dc, source_origin = regions[index]
+                    item.set_box(box)
+                    item.update_pixels(source_dc, source_origin)
                 else:
                     item.hide()
+            self.last_capture_box = capture_box
+            self.last_target_boxes = boxes_snapshot
         finally:
-            gdi32.SelectObject(source_dc, old_source_bitmap)
-            gdi32.DeleteObject(source_bitmap)
-            gdi32.DeleteDC(source_dc)
+            for popup_surface in popup_surfaces:
+                self._destroy_capture_surface(popup_surface)
             user32.ReleaseDC(None, screen_dc)
 
     def shutdown(self) -> None:
@@ -736,6 +1100,8 @@ class InvertApp:
             return
         self.running = False
         user32.KillTimer(self.hwnd, self.TIMER_ID)
+        self._destroy_capture_surface(self.target_surface)
+        self.target_surface = None
         for item in self.overlays:
             item.destroy()
         self.overlays.clear()
