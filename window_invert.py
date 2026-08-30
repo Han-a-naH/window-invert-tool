@@ -547,15 +547,15 @@ class InvertApp:
         self.overlay_class = "WindowInvertOverlay"
         self._callbacks: list[WNDPROC] = []
         self.overlays: list[Overlay] = []
+        self.targets: list[int] = []
+        self.target_states: dict[int, TargetState] = {}
+        # ``target`` remains as the primary target for tray double-click and
+        # compatibility with the original single-window implementation.
         self.target: Optional[int] = None
         self.enabled = False
         self.window_cache: dict[int, int] = {}
         self.tray_added = False
         self.menu_open = False
-        self.target_surface: Optional[CaptureSurface] = None
-        self.target_surface_key: Optional[tuple[int, int, int, int]] = None
-        self.last_capture_box: Optional[Box] = None
-        self.last_target_boxes: Optional[tuple[Box, ...]] = None
         self.process_name_cache: dict[int, tuple[int, str]] = {}
         self.render_fps = 30
         self.render_interval_ms = 33
@@ -619,10 +619,11 @@ class InvertApp:
         self.tray_added = bool(shell32.Shell_NotifyIconW(NIM_ADD, ctypes.byref(self.notify_data)))
 
     def _set_tray_tip(self) -> None:
-        if self.enabled and self.target:
-            tip = f"窗口反相：开启（{self.render_fps} FPS）"
-        elif self.target:
-            tip = "窗口反相：关闭"
+        count = len(self.targets)
+        if self.enabled and count:
+            tip = f"窗口反相：开启（{count} 个窗口，{self.render_fps} FPS）"
+        elif count:
+            tip = f"窗口反相：关闭（已选 {count} 个窗口）"
         else:
             tip = "窗口反相：未选择窗口"
         self.notify_data.szTip = tip
@@ -638,7 +639,7 @@ class InvertApp:
             self.tray_added = bool(shell32.Shell_NotifyIconW(NIM_ADD, ctypes.byref(self.notify_data)))
             return 0
         if msg == WM_TRAY and lparam in (WM_RBUTTONUP, WM_LBUTTONUP, WM_LBUTTONDBLCLK):
-            if lparam == WM_LBUTTONDBLCLK and self.target:
+            if lparam == WM_LBUTTONDBLCLK and self.targets:
                 self.enabled = not self.enabled
                 self._set_tray_tip()
                 self.refresh()
@@ -693,12 +694,12 @@ class InvertApp:
         for index, info in enumerate(windows):
             command = self.CMD_SELECT_BASE + index
             self.window_cache[command] = info.hwnd
-            marker = MF_CHECKED if info.hwnd == self.target else 0
+            marker = MF_CHECKED if info.hwnd in self.targets else 0
             label = f"{info.title[:88]}  ({info.hwnd:#x})".replace("&", "&&")
             user32.AppendMenuW(submenu, MF_STRING | marker, command, label)
         if not windows:
             user32.AppendMenuW(submenu, MF_STRING | MF_DISABLED, 0, "没有可选择的窗口")
-        user32.AppendMenuW(menu, MF_POPUP, submenu, "选择反相窗口")
+        user32.AppendMenuW(menu, MF_POPUP, submenu, "选择/取消反相窗口")
         user32.AppendMenuW(menu, MF_STRING | (MF_CHECKED if self.enabled else 0),
                            self.CMD_TOGGLE, "关闭反相" if self.enabled else "开启反相")
         for index, (fps, _interval, label) in enumerate(self.RENDER_SPEEDS):
@@ -723,7 +724,7 @@ class InvertApp:
         user32.DestroyMenu(speed_menu)
         user32.DestroyMenu(menu)
         if command in self.window_cache:
-            self.select_window(self.window_cache[command])
+            self.toggle_window(self.window_cache[command])
         elif command == self.CMD_TOGGLE:
             self.toggle()
         elif self.CMD_SPEED_BASE <= command < self.CMD_SPEED_BASE + len(self.RENDER_SPEEDS):
@@ -744,30 +745,41 @@ class InvertApp:
             self._set_tray_tip()
             return
 
-    def select_window(self, hwnd: int) -> None:
+    def _drop_target(self, hwnd: int) -> None:
+        state = self.target_states.pop(hwnd, None)
+        if state:
+            self._destroy_capture_surface(state.surface)
+        if hwnd in self.targets:
+            self.targets.remove(hwnd)
+        if self.target == hwnd:
+            self.target = self.targets[-1] if self.targets else None
+        if not self.targets:
+            self.enabled = False
+
+    def toggle_window(self, hwnd: int) -> None:
         if not user32.IsWindow(HWND(hwnd)):
             return
-        if self.target != hwnd:
-            self._destroy_capture_surface(self.target_surface)
-            self.target_surface = None
-            self.target_surface_key = None
-            self.last_capture_box = None
-            self.last_target_boxes = None
-        self.target = hwnd
-        self.enabled = True
+        if hwnd in self.targets:
+            self._drop_target(hwnd)
+        else:
+            self.targets.append(hwnd)
+            self.target_states[hwnd] = TargetState(hwnd)
+            self.target = hwnd
+            self.enabled = True
         self._set_tray_tip()
         self.refresh()
 
+    def select_window(self, hwnd: int) -> None:
+        """Backward-compatible alias: selecting now toggles membership."""
+        self.toggle_window(hwnd)
+
     def toggle(self) -> None:
-        if not self.target or not user32.IsWindow(HWND(self.target)):
+        if not self.targets or not any(user32.IsWindow(HWND(hwnd)) for hwnd in self.targets):
             ctypes.windll.user32.MessageBoxW(self.hwnd, "请先选择反相窗口。", "窗口反相", 0x40)
+            for hwnd in list(self.targets):
+                self._drop_target(hwnd)
             self.target = None
             self.enabled = False
-            self._destroy_capture_surface(self.target_surface)
-            self.target_surface = None
-            self.target_surface_key = None
-            self.last_capture_box = None
-            self.last_target_boxes = None
             self._set_tray_tip()
             return
         self.enabled = not self.enabled
@@ -852,7 +864,8 @@ class InvertApp:
     def _owned_windows_above(self, target: int,
                              order: Optional[list[int]] = None) -> list[int]:
         """Find visible owned popups (menus/dialogs) above the target."""
-        order = order or self._z_order_windows()
+        if order is None:
+            order = self._z_order_windows()
         try:
             target_index = order.index(target)
         except ValueError:
@@ -860,7 +873,11 @@ class InvertApp:
         own_hosts = {_handle(item.host) for item in self.overlays if item.host}
         result: list[int] = []
         for hwnd in order[:target_index]:
-            if hwnd in own_hosts or hwnd == _handle(self.hwnd):
+            # A selected owned window is rendered by its own target state. Do
+            # not also include it as the parent's temporary popup surface, or
+            # the same pixels would be inverted twice.
+            if (hwnd in own_hosts or hwnd == _handle(self.hwnd)
+                    or hwnd in self.targets):
                 continue
             if not _is_owned_by(hwnd, target):
                 continue
@@ -874,14 +891,16 @@ class InvertApp:
                 result.append(hwnd)
         return result
 
-    def _visible_boxes(self, target: int, target_box: Optional[Box] = None) -> list[Box]:
+    def _visible_boxes(self, target: int, target_box: Optional[Box] = None,
+                       order: Optional[list[int]] = None) -> list[Box]:
         target_box = target_box or _rect_for(target)
         if not target_box or user32.IsIconic(HWND(target)) or not user32.IsWindowVisible(HWND(target)):
             return []
         target_box = _clip_box(target_box, _virtual_screen())
         if not target_box:
             return []
-        order = self._z_order_windows()
+        if order is None:
+            order = self._z_order_windows()
         try:
             target_index = order.index(target)
         except ValueError:
@@ -911,6 +930,65 @@ class InvertApp:
             if len(visible) > 160:
                 return []
         return visible
+
+    def _target_region(self, target: int, capture_box: Box,
+                       visible_box: Box, order: list[int],
+                       screen_dc: HDC) -> tuple[list[tuple[Box, HDC, Box]],
+                                                 list[CaptureSurface]]:
+        """Build overlay regions for one selected target and its owned popups."""
+        state = self.target_states.setdefault(target, TargetState(target))
+        boxes = self._visible_boxes(target, visible_box, order)
+        boxes_snapshot = tuple(boxes)
+        boxes_changed = state.last_boxes != boxes_snapshot
+        dpi_signature = self._dpi_signature(target)
+        surface_key = (capture_box.width, capture_box.height,
+                       dpi_signature[0], dpi_signature[1])
+        position_changed = bool(
+            state.last_capture_box
+            and (capture_box.left != state.last_capture_box.left
+                 or capture_box.top != state.last_capture_box.top)
+        )
+        need_capture = (
+            state.surface is None
+            or state.surface_key != surface_key
+            or (not position_changed and not boxes_changed)
+        )
+        if boxes and need_capture:
+            fresh_surface = self._capture_window(target, capture_box, screen_dc)
+            if fresh_surface:
+                self._destroy_capture_surface(state.surface)
+                state.surface = fresh_surface
+                state.surface_key = surface_key
+            elif state.surface is None or state.surface_key != surface_key:
+                state.last_capture_box = capture_box
+                state.last_boxes = boxes_snapshot
+                return [], []
+
+        popup_surfaces: list[CaptureSurface] = []
+        regions: list[tuple[Box, HDC, Box]] = []
+        if boxes and state.surface:
+            regions.extend((box, state.surface.dc, capture_box)
+                           for box in boxes)
+
+        for popup in self._owned_windows_above(target, order):
+            popup_capture_box = _window_rect_for(popup)
+            popup_visible_box = _rect_for(popup)
+            if not popup_capture_box or not popup_visible_box:
+                continue
+            popup_boxes = self._visible_boxes(popup, popup_visible_box, order)
+            if not popup_boxes:
+                continue
+            popup_surface = self._capture_window(popup, popup_capture_box,
+                                                 screen_dc)
+            if not popup_surface:
+                continue
+            popup_surfaces.append(popup_surface)
+            regions.extend((box, popup_surface.dc, popup_capture_box)
+                           for box in popup_boxes)
+
+        state.last_capture_box = capture_box
+        state.last_boxes = boxes_snapshot
+        return regions, popup_surfaces
 
     def _render_target(self, target: int, physical_box: Box,
                        screen_dc: HDC, output_dc: HDC) -> bool:
@@ -968,113 +1046,46 @@ class InvertApp:
                               capture_box, self._dpi_signature(target))
 
     def refresh(self) -> None:
-        if not self.enabled or not self.target or not user32.IsWindow(HWND(self.target)):
-            if self.target and not user32.IsWindow(HWND(self.target)):
-                self.target = None
-                self.enabled = False
-                self._destroy_capture_surface(self.target_surface)
-                self.target_surface = None
-                self.target_surface_key = None
-                self.last_capture_box = None
-                self.last_target_boxes = None
-                self._set_tray_tip()
+        # Remove windows that were closed while the tray app was idle.
+        removed_target = False
+        for hwnd in list(self.targets):
+            if not user32.IsWindow(HWND(hwnd)):
+                self._drop_target(hwnd)
+                removed_target = True
+        if removed_target:
+            self._set_tray_tip()
+        if not self.targets:
+            self.enabled = False
+            self.target = None
+        if not self.enabled:
             for item in self.overlays:
                 item.hide()
+            self._set_tray_tip()
             return
-        capture_box = _window_rect_for(self.target)
-        visible_box = _rect_for(self.target)
-        if not capture_box or not visible_box:
-            for item in self.overlays:
-                item.hide()
-            return
-        # Capture from the full Win32 rect, but place overlays against the DWM
-        # visible bounds. This removes invisible resize-border offsets while
-        # retaining correct content when the window crosses the left/top edge.
-        boxes = self._visible_boxes(self.target, visible_box)
-        boxes_snapshot = tuple(boxes)
-        boxes_changed = self.last_target_boxes != boxes_snapshot
+
         order = self._z_order_windows()
-        owned_windows = self._owned_windows_above(self.target, order)
-
-        # During a mouse move/drag loop some applications return a partially
-        # painted frame from PrintWindow. Reuse the last complete bitmap while
-        # only the window position or occlusion changes; the next unchanged
-        # frame refreshes it normally. This keeps the effect continuous without
-        # hiding half of the overlay during a drag.
-        dpi_signature = self._dpi_signature(self.target)
-        surface_key = (capture_box.width, capture_box.height,
-                       dpi_signature[0], dpi_signature[1])
-        position_changed = bool(
-            self.last_capture_box
-            and (capture_box.left != self.last_capture_box.left
-                 or capture_box.top != self.last_capture_box.top)
-        )
-
-        if not boxes and not owned_windows:
+        active_targets = [hwnd for hwnd in self.targets
+                          if user32.IsWindow(HWND(hwnd))]
+        if not active_targets:
             for item in self.overlays:
                 item.hide()
-            self.last_capture_box = capture_box
-            self.last_target_boxes = boxes_snapshot
             return
 
         screen_dc = user32.GetDC(None)
         if not screen_dc:
             return
+        regions: list[tuple[Box, HDC, Box]] = []
         popup_surfaces: list[CaptureSurface] = []
         try:
-            target_surface: Optional[CaptureSurface] = None
-            if boxes:
-                target_surface = self.target_surface
-                need_capture = (
-                    target_surface is None
-                    or self.target_surface_key != surface_key
-                    or (not position_changed and not boxes_changed)
-                )
-                if need_capture:
-                    fresh_surface = self._capture_window(self.target, capture_box,
-                                                         screen_dc)
-                    if fresh_surface:
-                        self._destroy_capture_surface(target_surface)
-                        target_surface = fresh_surface
-                        self.target_surface = fresh_surface
-                        self.target_surface_key = surface_key
-                    elif target_surface is None or self.target_surface_key != surface_key:
-                        for item in self.overlays:
-                            item.hide()
-                        self.last_capture_box = capture_box
-                        self.last_target_boxes = boxes_snapshot
-                        return
-                if target_surface:
-                    # The bitmap pixels are relative to the window frame, so
-                    # use the current frame origin even when reusing it after a
-                    # pure move.
-                    regions: list[tuple[Box, HDC, Box]] = [
-                        (box, target_surface.dc, capture_box) for box in boxes
-                    ]
-                else:
-                    regions = []
-            else:
-                regions = []
-
-            # Owned top-level popups (for example a browser context menu) are
-            # separate windows and therefore absent from PrintWindow(target).
-            # Capture each one independently and keep its rectangle out of the
-            # target's visible boxes so the two overlays do not overlap.
-            for popup in owned_windows:
-                popup_capture_box = _window_rect_for(popup)
-                popup_visible_box = _rect_for(popup)
-                if not popup_capture_box or not popup_visible_box:
+            for target in active_targets:
+                capture_box = _window_rect_for(target)
+                visible_box = _rect_for(target)
+                if not capture_box or not visible_box:
                     continue
-                popup_boxes = self._visible_boxes(popup, popup_visible_box)
-                if not popup_boxes:
-                    continue
-                popup_surface = self._capture_window(popup, popup_capture_box,
-                                                     screen_dc)
-                if not popup_surface:
-                    continue
-                popup_surfaces.append(popup_surface)
-                regions.extend((box, popup_surface.dc, popup_capture_box)
-                               for box in popup_boxes)
+                target_regions, target_popups = self._target_region(
+                    target, capture_box, visible_box, order, screen_dc)
+                regions.extend(target_regions)
+                popup_surfaces.extend(target_popups)
 
             while len(self.overlays) < len(regions):
                 try:
@@ -1088,8 +1099,6 @@ class InvertApp:
                     item.update_pixels(source_dc, source_origin)
                 else:
                     item.hide()
-            self.last_capture_box = capture_box
-            self.last_target_boxes = boxes_snapshot
         finally:
             for popup_surface in popup_surfaces:
                 self._destroy_capture_surface(popup_surface)
@@ -1100,8 +1109,10 @@ class InvertApp:
             return
         self.running = False
         user32.KillTimer(self.hwnd, self.TIMER_ID)
-        self._destroy_capture_surface(self.target_surface)
-        self.target_surface = None
+        for state in self.target_states.values():
+            self._destroy_capture_surface(state.surface)
+        self.target_states.clear()
+        self.targets.clear()
         for item in self.overlays:
             item.destroy()
         self.overlays.clear()
